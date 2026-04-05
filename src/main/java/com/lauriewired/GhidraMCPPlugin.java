@@ -49,14 +49,34 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 import javax.swing.SwingUtilities;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.InputStreamReader;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.lang.reflect.InvocationTargetException;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import ghidra.app.script.GhidraScript;
+import ghidra.app.script.GhidraScriptProvider;
+import ghidra.app.script.GhidraScriptUtil;
+import ghidra.app.script.GhidraState;
+import generic.jar.ResourceFile;
 
 @PluginInfo(
     status = PluginStatus.RELEASED,
@@ -339,6 +359,19 @@ public class GhidraMCPPlugin extends Plugin {
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
+        });
+
+        // --- Dynamic script discovery & execution endpoints ---
+        server.createContext("/scripts", exchange -> {
+            sendJsonResponse(exchange, listScripts());
+        });
+
+        server.createContext("/run_script", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String name = params.get("name");
+            String argsJson = params.getOrDefault("args_json", "{}");
+            int timeoutMs = parseIntOrDefault(params.get("timeout_ms"), 120000);
+            sendJsonResponse(exchange, runScript(name, argsJson, timeoutMs));
         });
 
         server.setExecutor(null);
@@ -1636,6 +1669,261 @@ public class GhidraMCPPlugin extends Plugin {
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(bytes);
         }
+    }
+
+    private void sendJsonResponse(HttpExchange exchange, String json) throws IOException {
+        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Dynamic script discovery & execution
+    // ----------------------------------------------------------------------------------
+
+    private static final Pattern MCP_TOOL_RE = Pattern.compile("^[#/\\s*]*@mcp-tool\\s+(\\S+)\\s*(.*)$");
+    private static final Pattern MCP_ARG_RE  = Pattern.compile("^[#/\\s*]*@mcp-arg\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*(\\w+)\\s*(?::\\s*(.*))?$");
+    private static final Pattern MCP_DESC_RE = Pattern.compile("^[#/\\s*]*@mcp-desc\\s+(.*)$");
+    private static final Pattern CATEGORY_RE = Pattern.compile("^[#/\\s*]*@category\\s+(.*)$");
+
+    /** Returns JSON listing of all .py / .java scripts with parsed @mcp-* header metadata. */
+    private String listScripts() {
+        List<String> entries = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        List<ResourceFile> dirs;
+        try {
+            dirs = GhidraScriptUtil.getScriptSourceDirectories();
+        } catch (Throwable t) {
+            return "{\"error\": " + jsonEscape(String.valueOf(t)) + ", \"scripts\": []}";
+        }
+        for (ResourceFile dir : dirs) {
+            ResourceFile[] files;
+            try {
+                files = dir.listFiles();
+            } catch (Throwable t) {
+                continue;
+            }
+            if (files == null) continue;
+            for (ResourceFile f : files) {
+                String fname = f.getName();
+                if (fname == null) continue;
+                if (!(fname.endsWith(".py") || fname.endsWith(".java"))) continue;
+                if (seen.contains(fname)) continue; // first hit wins (earlier dirs override)
+                seen.add(fname);
+                entries.add(parseScriptHeaderJson(f));
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"scripts\": [");
+        for (int i = 0; i < entries.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append(entries.get(i));
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    /** Reads header lines of a script and emits a JSON object with its metadata. */
+    private String parseScriptHeaderJson(ResourceFile f) {
+        String name = f.getName();
+        String baseName = name;
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) baseName = name.substring(0, dot);
+        String path = "";
+        try { path = f.getAbsolutePath(); } catch (Throwable ignored) {}
+
+        String category = "";
+        String description = "";
+        String mcpTool = null;
+        String mcpDesc = null;
+        List<String[]> mcpArgs = new ArrayList<>(); // [name, type, description]
+
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(f.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            int count = 0;
+            while ((line = br.readLine()) != null && count < 80) {
+                count++;
+                String trimmed = line.trim();
+                Matcher m;
+                m = MCP_TOOL_RE.matcher(trimmed);
+                if (m.find()) { mcpTool = m.group(1).trim(); continue; }
+                m = MCP_ARG_RE.matcher(trimmed);
+                if (m.find()) {
+                    String argName = m.group(1);
+                    String argType = m.group(2);
+                    String argDesc = m.group(3) == null ? "" : m.group(3).trim();
+                    mcpArgs.add(new String[]{argName, argType, argDesc});
+                    continue;
+                }
+                m = MCP_DESC_RE.matcher(trimmed);
+                if (m.find()) { mcpDesc = m.group(1).trim(); continue; }
+                m = CATEGORY_RE.matcher(trimmed);
+                if (m.find()) { category = m.group(1).trim(); continue; }
+                // first non-empty docstring-looking line after the headers becomes description
+                if (description.isEmpty() && !trimmed.isEmpty()
+                        && !trimmed.startsWith("#") && !trimmed.startsWith("//")
+                        && !trimmed.startsWith("@") && !trimmed.startsWith("\"\"\"")
+                        && !trimmed.startsWith("'''") && !trimmed.startsWith("import ")
+                        && !trimmed.startsWith("from ")) {
+                    description = trimmed;
+                }
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        sb.append("\"name\":").append(jsonEscape(baseName));
+        sb.append(",\"filename\":").append(jsonEscape(name));
+        sb.append(",\"path\":").append(jsonEscape(path));
+        sb.append(",\"category\":").append(jsonEscape(category));
+        sb.append(",\"description\":").append(jsonEscape(mcpDesc != null ? mcpDesc : description));
+        sb.append(",\"mcp_tool\":");
+        if (mcpTool == null) sb.append("null"); else sb.append(jsonEscape(mcpTool));
+        sb.append(",\"mcp_args\":[");
+        for (int i = 0; i < mcpArgs.size(); i++) {
+            if (i > 0) sb.append(",");
+            String[] a = mcpArgs.get(i);
+            sb.append("{");
+            sb.append("\"name\":").append(jsonEscape(a[0]));
+            sb.append(",\"type\":").append(jsonEscape(a[1]));
+            sb.append(",\"description\":").append(jsonEscape(a[2]));
+            sb.append("}");
+        }
+        sb.append("]");
+        sb.append("}");
+        return sb.toString();
+    }
+
+    /** Executes a Ghidra script by name, passing args via GhidraState env var + setScriptArgs. */
+    private String runScript(String name, String argsJson, int timeoutMs) {
+        if (name == null || name.isEmpty()) {
+            return "{\"ok\":false,\"error\":\"missing script name\"}";
+        }
+        // Accept name with or without extension
+        String lookup = name;
+        if (!lookup.endsWith(".py") && !lookup.endsWith(".java")) {
+            lookup = name + ".py";
+        }
+        ResourceFile scriptFile;
+        try {
+            scriptFile = GhidraScriptUtil.findScriptByName(lookup);
+        } catch (Throwable t) {
+            return "{\"ok\":false,\"error\":" + jsonEscape("findScriptByName failed: " + t) + "}";
+        }
+        if (scriptFile == null) {
+            return "{\"ok\":false,\"error\":" + jsonEscape("script not found: " + lookup) + "}";
+        }
+
+        Program program = getCurrentProgram();
+        GhidraScriptProvider provider;
+        try {
+            provider = GhidraScriptUtil.getProvider(scriptFile);
+        } catch (Throwable t) {
+            return "{\"ok\":false,\"error\":" + jsonEscape("no provider for " + lookup + ": " + t) + "}";
+        }
+        if (provider == null) {
+            return "{\"ok\":false,\"error\":" + jsonEscape("no provider for " + lookup) + "}";
+        }
+
+        StringWriter outBuf = new StringWriter();
+        StringWriter errBuf = new StringWriter();
+        PrintWriter outWriter = new PrintWriter(outBuf, true);
+        PrintWriter errWriter = new PrintWriter(errBuf, true);
+
+        long start = System.currentTimeMillis();
+        final GhidraScript[] scriptHolder = new GhidraScript[1];
+        try {
+            scriptHolder[0] = provider.getScriptInstance(scriptFile, errWriter);
+        } catch (Throwable t) {
+            return "{\"ok\":false,\"error\":" + jsonEscape("getScriptInstance failed: " + t) + "}";
+        }
+        final GhidraScript script = scriptHolder[0];
+
+        GhidraState state = new GhidraState(tool, tool.getProject(), program, null, null, null);
+        state.addEnvironmentVar("GHIDRA_MCP_ARGS", argsJson);
+        script.setScriptArgs(new String[]{"--mcp-args", argsJson});
+        script.setReusePreviousChoices(false);
+
+        ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+
+        ExecutorService exec = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "GhidraMCP-Script-Runner");
+            t.setDaemon(true);
+            return t;
+        });
+        Future<String> fut = exec.submit(() -> {
+            try {
+                script.execute(state, monitor, outWriter);
+                return null;
+            } catch (Throwable t) {
+                StringWriter sw = new StringWriter();
+                t.printStackTrace(new PrintWriter(sw));
+                return sw.toString();
+            }
+        });
+
+        String error = null;
+        boolean timedOut = false;
+        try {
+            error = fut.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException te) {
+            timedOut = true;
+            monitor.cancel();
+            fut.cancel(true);
+            error = "timeout after " + timeoutMs + "ms";
+        } catch (Exception e) {
+            StringWriter sw = new StringWriter();
+            e.printStackTrace(new PrintWriter(sw));
+            error = sw.toString();
+        } finally {
+            exec.shutdownNow();
+        }
+        long duration = System.currentTimeMillis() - start;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        sb.append("\"ok\":").append(error == null ? "true" : "false");
+        sb.append(",\"script\":").append(jsonEscape(scriptFile.getName()));
+        sb.append(",\"duration_ms\":").append(duration);
+        sb.append(",\"timed_out\":").append(timedOut);
+        sb.append(",\"stdout\":").append(jsonEscape(outBuf.toString()));
+        sb.append(",\"stderr\":").append(jsonEscape(errBuf.toString()));
+        sb.append(",\"error\":");
+        if (error == null) sb.append("null"); else sb.append(jsonEscape(error));
+        sb.append("}");
+        return sb.toString();
+    }
+
+    /** Minimal JSON string escaper — returns value wrapped in double quotes. */
+    private static String jsonEscape(String s) {
+        if (s == null) return "null";
+        StringBuilder sb = new StringBuilder(s.length() + 2);
+        sb.append('"');
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"':  sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\b': sb.append("\\b"); break;
+                case '\f': sb.append("\\f"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        sb.append('"');
+        return sb.toString();
     }
 
     @Override
